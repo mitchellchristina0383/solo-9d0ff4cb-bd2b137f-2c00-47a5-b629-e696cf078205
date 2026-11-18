@@ -33,6 +33,14 @@
   .msg.err { color: #c62828; } .msg.ok { color: #2e7d32; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
   a.dl { font-weight: 600; }
+  .hit { border: 1px solid #8884; border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+  .hit .where { font-size: .85rem; color: #888; margin-bottom: 4px; }
+  .hit .message { font-weight: 600; font-size: .92rem; }
+  .hit pre { background: #8881; border-radius: 6px; padding: 8px; margin: 6px 0 0;
+             overflow-x: auto; font-size: .8rem; white-space: pre-wrap; word-break: break-all; }
+  .pkg-note { font-size: .85rem; margin: 4px 0; }
+  .pkg-note.warn { color: #b87a10; }
+  mark { background: #ffd54f; color: inherit; border-radius: 2px; padding: 0 1px; }
 </style>
 </head>
 <body>
@@ -63,8 +71,21 @@
 
 <section>
   <h2>任务列表</h2>
-  <div class="row"><button id="refreshBtn">刷新</button><span class="muted">重开页面后在此查看各任务已收分块，选择同一文件即可补齐。</span></div>
+  <div class="row"><button id="refreshBtn">刷新</button><span class="muted">重开页面后在此查看各任务已收分块，选择同一文件即可补齐。已发布的包可建立日志索引。</span></div>
   <div id="taskList"></div>
+</section>
+
+<section>
+  <h2>日志检索（按 message 字面子串，区分大小写）</h2>
+  <p class="muted">在已建立索引的已发布包中查找 ZIP 内 JSONL 日志的 message 字段；结果显示任务、ZIP 条目、行号与原文。
+  若包文件与登记摘要不符，该包的旧索引会被移除且不参与命中，修复原包后需重建索引。</p>
+  <div class="row">
+    <input type="text" id="q" placeholder="报错短语，例如 ERROR disk full" style="flex:1;min-width:240px">
+    <button id="searchBtn">搜索</button>
+  </div>
+  <div id="searchMsg" class="msg"></div>
+  <div id="pkgNotes"></div>
+  <div id="hits"></div>
 </section>
 
 <script>
@@ -72,6 +93,8 @@
 const $ = id => document.getElementById(id);
 const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 const fmtSize = n => n >= 1048576 ? (n/1048576).toFixed(2) + " MiB" : (n/1024).toFixed(1) + " KiB";
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 let pickedFile = null, pickedSha = null;
 
@@ -188,12 +211,97 @@ async function finalizeTask(taskId) {
   await refreshTasks();
 }
 
+async function buildIndex(taskId, alreadyIndexed) {
+  const msgEl = document.querySelector(`#msg-${taskId}`);
+  try {
+    const r = await api("POST",
+      `/api/tasks/${taskId}/index${alreadyIndexed ? "?force=true" : ""}`);
+    if (msgEl) {
+      msgEl.className = "msg ok";
+      msgEl.textContent = r.built
+        ? `索引已建立：${r.lines} 行日志 / ${r.entries} 个 ZIP 条目（累计解压 ${fmtSize(r.uncompressed)}）。`
+        : `索引已存在且为最新：${r.lines} 行 / ${r.entries} 个条目。`;
+    }
+  } catch (e) {
+    const d = e.data || {};
+    let text = e.message;
+    if (d.state === "corrupt") text = d.detail;
+    else if (d.reason) text = `建索引失败（${d.reason}）：${d.detail}`;
+    if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = text; }
+  }
+  await refreshTasks();
+}
+
+function highlightInto(el, text, query) {
+  // 安全高亮：全部通过文本节点插入，匹配片段包 <mark>
+  let i = 0;
+  while (true) {
+    const j = text.indexOf(query, i);
+    if (j === -1) { el.appendChild(document.createTextNode(text.slice(i))); break; }
+    el.appendChild(document.createTextNode(text.slice(i, j)));
+    const m = document.createElement("mark");
+    m.textContent = text.slice(j, j + query.length);
+    el.appendChild(m);
+    i = j + query.length;
+  }
+}
+
+async function doSearch() {
+  const q = $("q").value;
+  const msgEl = $("searchMsg"), notesEl = $("pkgNotes"), hitsEl = $("hits");
+  msgEl.className = "msg"; msgEl.textContent = "";
+  notesEl.textContent = ""; hitsEl.textContent = "";
+  if (!q) { msgEl.className = "msg err"; msgEl.textContent = "请输入要查找的报错短语。"; return; }
+  let r;
+  try {
+    r = await api("GET", `/api/search?q=${encodeURIComponent(q)}`);
+  } catch (e) {
+    msgEl.className = "msg err"; msgEl.textContent = "搜索失败: " + e.message;
+    return;
+  }
+  for (const p of r.packages) {
+    if (p.state === "searched") continue;
+    const note = document.createElement("div");
+    note.className = "pkg-note warn";
+    note.textContent = `包 ${p.filename}（${p.task_id.slice(0, 8)}…）：${p.detail || p.state}`;
+    notesEl.appendChild(note);
+  }
+  const searched = r.packages.filter(p => p.state === "searched");
+  const total = searched.reduce((a, p) => a + p.hits, 0);
+  if (r.hits.length) {
+    msgEl.textContent = `命中 ${total} 行` +
+      (r.truncated ? `（仅显示前 ${r.hits.length} 条）` : "") + "：";
+  } else if (searched.length) {
+    msgEl.textContent = "已索引的包中没有匹配行。";
+  } else {
+    msgEl.textContent = "暂无已索引的包可搜索，请先在已发布的包上建立索引。";
+  }
+  for (const h of r.hits) {
+    const div = document.createElement("div");
+    div.className = "hit";
+    const where = document.createElement("div");
+    where.className = "where";
+    where.textContent = `任务 ${h.filename}（${h.task_id.slice(0, 8)}…） · ZIP 条目 ${h.entry} · 第 ${h.line} 行`;
+    const msg = document.createElement("div");
+    msg.className = "message";
+    highlightInto(msg, h.message, q);
+    const pre = document.createElement("pre");
+    pre.textContent = h.text;
+    div.append(where, msg, pre);
+    hitsEl.appendChild(div);
+  }
+}
+
 function taskCard(t) {
   const div = document.createElement("div");
   div.className = "task";
   const pct = t.total_chunks ? Math.round(100 * t.received_count / t.total_chunks) : 100;
+  const idx = t.index || { indexed: false };
+  const idxText = idx.indexed
+    ? `索引：${idx.lines} 行 / ${idx.entries} 个条目 · 建于 ${idx.built_at}`
+    : "尚未建索引";
   div.innerHTML = `
-    <div><b>${t.filename}</b> · ${fmtSize(t.size)}
+    <div><b>${esc(t.filename)}</b> · ${fmtSize(t.size)}
       <span class="badge st-${t.state}">${{uploading:"上传中",published:"已发布",failed:"已拒绝"}[t.state]}</span></div>
     <div class="mono muted">id: ${t.task_id}<br>sha256: ${t.sha256}</div>
     <div class="bar"><div id="bar-${t.task_id}" style="width:${pct}%"></div></div>
@@ -203,7 +311,10 @@ function taskCard(t) {
       ${t.state === "uploading" ? `
         <label>选择文件续传 <input type="file" id="re-${t.task_id}" style="display:none"></label>
         <button id="fin-${t.task_id}">提交完成</button>` : ""}
-      ${t.state === "published" ? `<a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${t.filename}</a>` : ""}
+      ${t.state === "published" ? `
+        <a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${esc(t.filename)}</a>
+        <button id="idx-${t.task_id}">${idx.indexed ? "重建索引" : "建立索引"}</button>
+        <span class="muted">${idxText}</span>` : ""}
       ${t.state === "failed" ? `<span class="msg err">摘要校验未通过，已拒绝发布，请重新创建任务。</span>` : ""}
     </div>
     <div class="msg" id="msg-${t.task_id}"></div>`;
@@ -213,6 +324,10 @@ function taskCard(t) {
       if (f) uploadMissing(t.task_id, f);
     };
     div.querySelector(`#fin-${t.task_id}`).onclick = () => finalizeTask(t.task_id);
+  }
+  if (t.state === "published") {
+    div.querySelector(`#idx-${t.task_id}`).onclick =
+      () => buildIndex(t.task_id, idx.indexed);
   }
   return div;
 }
@@ -245,6 +360,8 @@ async function refreshTasks() {
 }
 
 $("refreshBtn").onclick = refreshTasks;
+$("searchBtn").onclick = doSearch;
+$("q").addEventListener("keydown", ev => { if (ev.key === "Enter") doSearch(); });
 refreshTasks();
 </script>
 </body>

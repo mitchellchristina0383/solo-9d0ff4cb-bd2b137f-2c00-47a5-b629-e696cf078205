@@ -59,9 +59,16 @@ class Storage:
         self.published_dir = self.root / "published"
         self.tmp_dir = self.root / "tmp"
         self.locks_dir = self.root / "locks"
+        self.indexes_dir = self.root / "indexes"
 
     def ensure_dirs(self) -> None:
-        for d in (self.chunks_dir, self.published_dir, self.tmp_dir, self.locks_dir):
+        for d in (
+            self.chunks_dir,
+            self.published_dir,
+            self.tmp_dir,
+            self.locks_dir,
+            self.indexes_dir,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
     def chunk_path(self, task_id: str, index: int) -> Path:
@@ -73,6 +80,9 @@ class Storage:
     def lock_path(self, task_id: str) -> Path:
         return self.locks_dir / f"{task_id}.lock"
 
+    def index_path(self, task_id: str) -> Path:
+        return self.indexes_dir / f"{task_id}.jsonl"
+
     def cleanup_stale_tmp(self, max_age_sec: float = 3600.0) -> None:
         """Remove orphaned temp files older than *max_age_sec*.
 
@@ -80,7 +90,7 @@ class Storage:
         that a concurrently running process is about to rename.
         """
         now = time.time()
-        for pattern in (".tmp-*", ".pub-*"):
+        for pattern in (".tmp-*", ".pub-*", ".idx-*"):
             for p in self.tmp_dir.glob(pattern):
                 try:
                     if now - p.stat().st_mtime > max_age_sec:

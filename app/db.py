@@ -8,6 +8,7 @@ mutation is a single statement, hence atomic.
 from __future__ import annotations
 
 import sqlite3
+import time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -45,9 +46,24 @@ def connect(db_path) -> sqlite3.Connection:
     return conn
 
 
-def init_db(db_path) -> None:
-    conn = connect(db_path)
-    try:
-        conn.executescript(SCHEMA)
-    finally:
-        conn.close()
+def init_db(db_path, attempts: int = 100) -> None:
+    """Create the schema; safe to call from several processes at once.
+
+    When two processes initialize a *fresh* database file concurrently,
+    ``PRAGMA journal_mode=WAL`` can fail immediately with "database is
+    locked" (SQLite does not consult the busy handler for that particular
+    lock), so retry briefly. Callers that can take an flock (create_app)
+    serialize initialization anyway; this is a safety net.
+    """
+    for attempt in range(attempts):
+        try:
+            conn = connect(db_path)
+            try:
+                conn.executescript(SCHEMA)
+            finally:
+                conn.close()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.05 + 0.05 * (attempt % 10))

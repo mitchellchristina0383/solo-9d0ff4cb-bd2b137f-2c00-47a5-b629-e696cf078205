@@ -6,6 +6,12 @@ Flow:
   3. POST /api/tasks/{id}/finalize     verify chunks+size+sha256, then publish
   4. GET  /api/tasks/{id}/download     download the published package
 
+Log search over published ZIP packages:
+  5. POST /api/tasks/{id}/index        build a reusable .jsonl index of the
+                                       package's log lines (idempotent)
+  6. GET  /api/search?q=...            literal substring search on the
+                                       "message" field across indexed packages
+
 Safety properties:
   * a chunk recorded in the DB and present on disk is immutable: re-uploading
     identical content is a no-op, different content is rejected with 409 and
@@ -14,6 +20,12 @@ Safety properties:
     published file appears only via an atomic rename after full
     size+sha256 verification, so a crash or a disk error can never publish a
     partial file and two processes can never produce two different products;
+  * index builds re-verify the registered size+sha256, parse strictly, cap
+    cumulative decompression at 32 MiB, and install the index via an atomic
+    rename under the same per-task flock: bad logs, duplicate entry paths,
+    corrupt zips or concurrent builders never leave a partial or second
+    index; a package that no longer matches its registered digest yields no
+    search hits and its stale index is removed;
   * all state lives in SQLite (WAL) and on disk, so restarts resume cleanly
     and already published packages stay downloadable.
 """
@@ -32,7 +44,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import storage as storage_mod
+from . import indexer, storage as storage_mod
 from .db import connect, init_db
 from .storage import Storage
 
@@ -73,7 +85,15 @@ def create_app(data_dir=None) -> FastAPI:
     data_dir = Path(data_dir or os.environ.get("DATA_DIR", "data")).resolve()
     storage = Storage(data_dir)
     storage.ensure_dirs()
-    init_db(storage.db_path)
+    # Serialize one-time DB initialization across processes: two servers
+    # starting together on a fresh data dir otherwise race inside
+    # PRAGMA journal_mode=WAL, which fails fast with "database is locked".
+    init_lock = open(storage.locks_dir / "init.lock", "w")
+    try:
+        fcntl.flock(init_lock.fileno(), fcntl.LOCK_EX)
+        init_db(storage.db_path)
+    finally:
+        init_lock.close()
     storage.cleanup_stale_tmp()
 
     app = FastAPI(title="Incident Package Uploader")
@@ -84,6 +104,50 @@ def create_app(data_dir=None) -> FastAPI:
         if row is None:
             raise HTTPException(404, "task not found")
         return row
+
+    def index_info(task_id: str) -> dict:
+        """Index state for a task, derived from the .jsonl index file itself.
+
+        'indexed' here means a complete index file exists; whether the
+        underlying package still matches its registered digest is enforced
+        at search/build time (that check requires hashing the package).
+        """
+        meta = indexer.read_index_meta(storage.index_path(task_id))
+        if meta is None:
+            return {"indexed": False}
+        return {
+            "indexed": True,
+            "entries": meta.get("entries"),
+            "lines": meta.get("lines"),
+            "uncompressed": meta.get("uncompressed"),
+            "built_at": meta.get("built_at"),
+        }
+
+    def remove_stale_index(task_id: str) -> None:
+        """Delete a task's index iff the package fails registered verification.
+
+        Serialized with concurrent builders via the per-task flock and
+        re-verified inside the lock, so a package that was fixed in the
+        meantime keeps its (valid) index.
+        """
+        lock_file = open(storage.lock_path(task_id), "w")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            conn = connect(storage.db_path)
+            try:
+                row = conn.execute(
+                    "SELECT size, sha256 FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return
+            if not indexer.verify_package(
+                storage.published_path(task_id), row["size"], row["sha256"]
+            ):
+                storage_mod.unlink_quiet(storage.index_path(task_id))
+        finally:
+            lock_file.close()
 
     def status_payload(conn, task) -> dict:
         rows = conn.execute(
@@ -109,6 +173,7 @@ def create_app(data_dir=None) -> FastAPI:
         }
         if task["state"] == "published":
             payload["download_url"] = f"/api/tasks/{task['id']}/download"
+            payload["index"] = index_info(task["id"])
         return payload
 
     # ------------------------------------------------------------- API
@@ -163,6 +228,11 @@ def create_app(data_dir=None) -> FastAPI:
                         "state": r["state"],
                         "created_at": r["created_at"],
                         "published_at": r["published_at"],
+                        **(
+                            {"index": index_info(r["id"])}
+                            if r["state"] == "published"
+                            else {}
+                        ),
                     }
                     for r in rows
                 ]
@@ -402,6 +472,150 @@ def create_app(data_dir=None) -> FastAPI:
             filename=task["filename"],
             media_type="application/octet-stream",
         )
+
+    @app.post("/api/tasks/{task_id}/index")
+    def build_index(task_id: str, force: bool = False):
+        conn = connect(storage.db_path)
+        try:
+            task = get_task_or_404(conn, task_id)
+        finally:
+            conn.close()
+        if task["state"] != "published":
+            raise HTTPException(
+                409, f"task is '{task['state']}'; only published packages"
+                " can be indexed"
+            )
+
+        # Serialize index builds of this task across all service processes:
+        # two concurrent builders can never produce two index versions.
+        lock_file = open(storage.lock_path(task_id), "w")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            idx = storage.index_path(task_id)
+
+            # The on-disk package must match the registered size+sha256
+            # before anything is read from it; otherwise any existing index
+            # is stale and must not serve hits.
+            if not indexer.verify_package(
+                storage.published_path(task_id), task["size"], task["sha256"]
+            ):
+                storage_mod.unlink_quiet(idx)
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "state": "corrupt",
+                        "detail": "published file on disk does not match the"
+                        " registered size/sha256; stale index removed."
+                        " Restore the package and retry.",
+                    },
+                )
+
+            if not force:
+                meta = indexer.read_index_meta(idx)
+                if meta is not None:
+                    return {
+                        "state": "indexed",
+                        "built": False,
+                        "detail": "index already exists and is current",
+                        "entries": meta.get("entries"),
+                        "lines": meta.get("lines"),
+                        "uncompressed": meta.get("uncompressed"),
+                        "built_at": meta.get("built_at"),
+                    }
+                # missing or unreadable index: fall through and (re)build
+
+            try:
+                stats = indexer.build_index(storage, task, _now_iso())
+            except indexer.IndexBuildError as exc:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "state": "failed",
+                        "reason": exc.reason,
+                        "detail": exc.detail,
+                    },
+                )
+            except OSError as exc:
+                raise HTTPException(500, f"disk write failed: {exc}")
+            return {"state": "indexed", "built": True, **stats}
+        finally:
+            lock_file.close()
+
+    @app.get("/api/search")
+    def search(q: str = "", task_id: str | None = None, limit: int = 200):
+        if q == "":
+            raise HTTPException(400, "q must be a non-empty literal substring")
+        limit = max(1, min(limit, 1000))
+
+        conn = connect(storage.db_path)
+        try:
+            if task_id is not None:
+                tasks = [get_task_or_404(conn, task_id)]
+            else:
+                tasks = conn.execute(
+                    "SELECT * FROM tasks WHERE state = 'published'"
+                    " ORDER BY created_at DESC"
+                ).fetchall()
+        finally:
+            conn.close()
+
+        hits = []
+        packages = []
+        truncated = False
+        for task in tasks:
+            entry = {"task_id": task["id"], "filename": task["filename"]}
+            if task["state"] != "published":
+                packages.append(
+                    {**entry, "state": "not_published", "hits": 0,
+                     "detail": f"task is '{task['state']}'"}
+                )
+                continue
+            idx = storage.index_path(task["id"])
+            if not idx.exists():
+                if task_id is not None:
+                    packages.append(
+                        {**entry, "state": "not_indexed", "hits": 0,
+                         "detail": "no index yet; build it first"}
+                    )
+                continue
+            # A package that no longer matches its registered digest must
+            # not contribute old hits; drop its stale index.
+            if not indexer.verify_package(
+                storage.published_path(task["id"]), task["size"], task["sha256"]
+            ):
+                remove_stale_index(task["id"])
+                packages.append(
+                    {**entry, "state": "stale", "hits": 0,
+                     "detail": "package on disk no longer matches the"
+                     " registered size/sha256; stale index removed, no hits"
+                     " returned. Restore the package and rebuild the index."}
+                )
+                continue
+            try:
+                n = 0
+                for hit in indexer.iter_index_hits(idx, q):
+                    n += 1
+                    if len(hits) < limit:
+                        hits.append(
+                            {"task_id": task["id"],
+                             "filename": task["filename"], **hit}
+                        )
+                    else:
+                        truncated = True
+                packages.append({**entry, "state": "searched", "hits": n})
+            except indexer.IndexFileError as exc:
+                storage_mod.unlink_quiet(idx)
+                packages.append(
+                    {**entry, "state": "index_error", "hits": 0,
+                     "detail": f"index file corrupted ({exc}); removed,"
+                     " please rebuild"}
+                )
+        return {
+            "query": q,
+            "hits": hits,
+            "truncated": truncated,
+            "packages": packages,
+        }
 
     @app.get("/", response_class=HTMLResponse)
     def index_page():

@@ -2,17 +2,23 @@
 
 Covers: concurrent chunk uploads (incl. duplicate and conflicting content),
 concurrent finalize from both processes, kill/restart mid-upload, and that
-published packages remain downloadable after restarts.
+published packages remain downloadable after restarts. Indexing: concurrent
+builds of the same package from two processes yield exactly one complete
+index, and a package corrupted on disk stops yielding hits (stale index
+removed) until the package is fixed and the index rebuilt.
 
 Run:  .venv/bin/python -m pytest tests/test_live.py -v
 """
 import hashlib
+import io
+import json
 import os
 import random
 import socket
 import subprocess
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -80,6 +86,24 @@ def create_task(client: httpx.Client, base: str, data: bytes) -> str:
 
 def put_chunk(client: httpx.Client, base: str, tid: str, i: int, payload: bytes):
     return client.put(f"{base}/api/tasks/{tid}/chunks/{i}", content=payload)
+
+
+def make_zip(files: dict) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return bio.getvalue()
+
+
+def publish(client: httpx.Client, base: str, data: bytes) -> str:
+    tid = create_task(client, base, data)
+    for i in range(0, len(data), CHUNK):
+        r = put_chunk(client, base, tid, i // CHUNK, data[i:i + CHUNK])
+        assert r.status_code == 200, r.text
+    r = client.post(f"{base}/api/tasks/{tid}/finalize")
+    assert r.json()["state"] == "published", r.text
+    return tid
 
 
 def test_two_processes_concurrent_upload_and_finalize(tmp_path):
@@ -197,6 +221,141 @@ def test_concurrent_duplicate_same_chunk_across_processes(tmp_path):
             assert client.post(f"{s2.base}/api/tasks/{tid}/finalize").json()[
                 "state"] == "published"
             assert client.get(f"{s1.base}/api/tasks/{tid}/download").content == data
+    finally:
+        s1.stop()
+        s2.stop()
+
+
+def test_two_processes_concurrent_index_build(tmp_path):
+    """Two processes building the same package's index: exactly one builds,
+    exactly one complete index file exists, both processes search it."""
+    data_dir = tmp_path / "data"
+    s1, s2 = Server(data_dir, tmp_path), Server(data_dir, tmp_path)
+    try:
+        s1.wait_ready()
+        s2.wait_ready()
+        n_lines = 3000
+        log = "".join(
+            json.dumps({"message": f"ERROR line {i}"}) + "\n"
+            for i in range(n_lines)
+        )
+        data = make_zip({"logs/app.log": log})
+
+        with httpx.Client(timeout=60) as client:
+            tid = publish(client, s1.base, data)
+
+            # 两个进程并发建同一包的索引
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futs = [
+                    ex.submit(client.post, f"{b}/api/tasks/{tid}/index")
+                    for b in (s1.base, s2.base)
+                ]
+                results = [f.result() for f in futs]
+            assert all(r.status_code == 200 for r in results), \
+                [r.text for r in results]
+            bodies = [r.json() for r in results]
+            assert all(b["state"] == "indexed" for b in bodies)
+            assert sum(1 for b in bodies if b["built"]) == 1  # 只有一个真正构建
+
+            # 磁盘上只有一版完整索引：meta + 全部命中行
+            idx_files = list((data_dir / "indexes").glob("*.jsonl"))
+            assert len(idx_files) == 1
+            lines = idx_files[0].read_text(encoding="utf-8").splitlines()
+            meta = json.loads(lines[0])
+            assert meta["_meta"] is True and meta["lines"] == n_lines
+            assert len(lines) == n_lines + 1
+            for raw in lines[1:]:
+                json.loads(raw)  # 每行都是完整 JSON
+
+            # 两个进程搜索结果一致
+            for base in (s1.base, s2.base):
+                r = client.get(f"{base}/api/search",
+                               params={"q": "ERROR line 2999"})
+                assert r.status_code == 200
+                hits = r.json()["hits"]
+                assert len(hits) == 1
+                assert hits[0]["entry"] == "logs/app.log"
+                assert hits[0]["line"] == 3000
+    finally:
+        s1.stop()
+        s2.stop()
+
+
+def test_stale_index_removed_and_rebuild_after_fix_across_processes(tmp_path):
+    """原包被改坏后（另一进程）搜索不得返回旧命中；修复后可重建。"""
+    data_dir = tmp_path / "data"
+    data = make_zip({"a.log": '{"message": "ERROR alpha"}\n'})
+    s1 = Server(data_dir, tmp_path)
+    s1.wait_ready()
+    with httpx.Client(timeout=30) as client:
+        tid = publish(client, s1.base, data)
+        assert client.post(f"{s1.base}/api/tasks/{tid}/index").json()["built"]
+        r = client.get(f"{s1.base}/api/search", params={"q": "alpha"})
+        assert len(r.json()["hits"]) == 1
+    s1.stop()
+
+    # 原包被改坏
+    (data_dir / "published" / tid).write_bytes(b"corrupted!")
+    s2 = Server(data_dir, tmp_path)
+    try:
+        s2.wait_ready()
+        with httpx.Client(timeout=30) as client:
+            r = client.get(f"{s2.base}/api/search", params={"q": "alpha"})
+            body = r.json()
+            assert body["hits"] == []  # 不得返回旧命中
+            assert body["packages"][0]["state"] == "stale"
+            assert not (data_dir / "indexes" / f"{tid}.jsonl").exists()
+            # 改坏状态下建索引被拒绝
+            assert client.post(
+                f"{s2.base}/api/tasks/{tid}/index").status_code == 409
+
+            # 修复原包后可重建，命中恢复
+            (data_dir / "published" / tid).write_bytes(data)
+            r = client.post(f"{s2.base}/api/tasks/{tid}/index")
+            assert r.status_code == 200 and r.json()["built"] is True
+            r = client.get(f"{s2.base}/api/search", params={"q": "alpha"})
+            assert len(r.json()["hits"]) == 1
+    finally:
+        s2.stop()
+
+
+def test_concurrent_build_and_search_never_partial(tmp_path):
+    """Search racing a concurrent build sees either no index or the complete
+    one — never partial hits."""
+    data_dir = tmp_path / "data"
+    s1, s2 = Server(data_dir, tmp_path), Server(data_dir, tmp_path)
+    try:
+        s1.wait_ready()
+        s2.wait_ready()
+        n_lines = 5000
+        log = "".join(
+            json.dumps({"message": f"ERROR row {i}"}) + "\n"
+            for i in range(n_lines)
+        )
+        data = make_zip({"big.log": log})
+        with httpx.Client(timeout=60) as client:
+            tid = publish(client, s1.base, data)
+
+            def build():
+                return client.post(f"{s1.base}/api/tasks/{tid}/index")
+
+            def search():
+                return client.get(f"{s2.base}/api/search",
+                                  params={"q": "ERROR row"})
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                build_fut = ex.submit(build)
+                search_futs = [ex.submit(search) for _ in range(8)]
+                assert build_fut.result().status_code == 200
+                for f in search_futs:
+                    body = f.result().json()
+                    # 要么索引尚未建立（0 命中），要么完整索引（全部命中）
+                    total = sum(p["hits"] for p in body["packages"])
+                    assert total in (0, n_lines), \
+                        f"partial hits observed: {total}"
+            # 建完后搜索必为完整命中
+            body = search().json()
+            assert sum(p["hits"] for p in body["packages"]) == n_lines
     finally:
         s1.stop()
         s2.stop()
